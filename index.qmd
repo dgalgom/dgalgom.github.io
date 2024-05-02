@@ -1,0 +1,815 @@
+---
+title: "R/Medicine 2024 Data Challenge: Opioid Use Disorder"
+title-block-banner: "navy" 
+author:
+- name: Daniel Gallardo Gómez
+  orcid: 0000-0002-3029-026X
+  email: daniel.gallardo.gomez@juntadeandalucia.es
+  affiliations:
+  - name: Health Technology Assessment Area (AETSA), Andalusian Public Foundation Progress and Health
+  - name: Epidemiology of Physical Activity and Fitness Across Lifespan (EPAFit) Research Group
+- name: Borja del Pozo Cruz
+  orcid: 0000-0003-3944-2212
+  affiliations:
+  - name: Faculty of Education, University of Cadiz
+  - name: Biomedical Research and Innovation Institute of Cádiz (INiBICA) Research Unit, University of Cadiz
+  - name: Department of Sports Science and Clinical Biomechanics, University of Southern Denmark
+lang: en
+format: 
+  html: 
+    toc: true
+    toc-location: left 
+editor: visual
+bibliography: references.bib
+---
+
+# Opioid Use Disorder
+
+## Background
+
+**Opioid use disorder** (OUD) is defined as the chronic use of opioids that causes clinically significant distress or impairment. Symptoms of this disease include an overpowering desire to consume opioids, increased opioid tolerance, and withdrawal syndrome when opioids are discontinued [@Leveille2024]. OUD affects over **16 million** people worldwide and over **2.1 million** in the United States. While opioid painkillers prescriptions are becoming more closely regulated, cases of overdose and addiction are still increasing, especially among younger people. Thus, it is considered an important global health concern.
+
+In this data analysis, we have tried to address how to optimize the treatments applied to alleviate OUD investigating their effectiveness against withdrawal symptoms, adherence, and pain.
+
+## Data processing and management
+
+First, we are going to load the required libraries to conduct the analyses.
+
+```{r, message=FALSE, results='hide', error=FALSE}
+library(public.ctn0094data)
+library(public.ctn0094extra)
+library(dplyr) # data wrangling
+library(tidyr) # data wrangling too
+library(ggplot2) # data visualization
+library(brms) # generalized linear modelling
+library(mgcv) # generalized additive models for very large datasets
+library(nnet) # for multinomial neural network algorithm
+library(tidybayes) # data analysis and plotting
+library(ggsci) # extra plot themes
+library(tvthemes) # additional themes
+library(marginaleffects) # counterfactual predictions and treatment effects 
+library(kableExtra) # table display
+library(DT) # table display
+library(plotly) # data visualization
+```
+
+Second, we are going to set up a dataset that gathers all important information (i.e., variables of interest) which could help us to understand latent patterns for which some treatments can be potentially more beneficial (i.e., reducing withdrawal symptoms, or increasing treatment adherence) for a specific sub-population within OUD patients. Our start point will be the `everybody` dataset, which contains all the participants with their corresponding identifiers (`who`), and the project they belonged.
+
+```{r}
+everybody %>% 
+  head() %>% 
+  kbl() %>% 
+  kable_styling(full_width = FALSE, 
+                position = "left")
+```
+
+To predict what type of patients could benefit more from OUD treatments, we add **demographic** information to our dataset.
+
+```{r, warning=FALSE}
+# selecting the variables of interest based on evidence that could potentially predict outcomes of interest
+new.demo <- demographics %>%
+  select(who, age, education, marital, is_male) %>%
+  cbind(derived_raceEthnicity$race_ethnicity) # adding the self-reported race and ethnicity from the extra data
+
+# dataset
+data <- everybody %>%
+  full_join(new.demo, by = "who") %>%
+  rename(race = `derived_raceEthnicity$race_ethnicity`)
+```
+
+Opioid addiction is rarely a stand-alone illness; frequently, people with opioid dependence are also struggling with a **mental health condition**. Therefore, psychiatric information can be useful to identify conditions that can be associated with OUDs.
+
+```{r, warning=FALSE}
+# selectig variables related to the Addiction Severity Index-Lite Follow-up scale for depression, anxiety and schizophrenia
+new.psycho <- psychiatric %>%
+  select(who, depression, anxiety, schizophrenia)
+
+# combining datasets
+data <- data %>%
+  full_join(new.psycho, by = "who") %>%
+  arrange(who)
+```
+
+Next, the time span for **detox** is included in our data. We checked out whether any patient had just one data point.
+
+```{r, collapse=TRUE, warning=FALSE, message=FALSE}
+# Checking data points
+detox %>% 
+  group_by(who) %>% 
+  summarise(n = n()) %>% 
+  ungroup() %>% 
+  filter(!n == 2)
+## all participants had admission and discharge data points
+
+# Creating the new variable with the detox time span for each patient
+new.detox <- detox %>% 
+  mutate(what = factor(what, levels = c("admission", 
+                                                "discharge"))) %>% # ensuring levels' names
+  arrange(what) %>% # ensuring discharge time point - admission time point
+  group_by(who) %>% 
+  summarise(when = last(when) - first(when))
+
+# combining datasets
+data <- data %>%
+  full_join(new.detox, by = "who") %>%
+  arrange(who)
+```
+
+It could be interesting exploring the relationship between **nicotine** and **opioid** use and abuse. There are several pathways by which unique nicotine-opioid interactions may confer greater risk for prescription opioid misuse. First, chronic nicotine exposure may result in dysregulation of the endogenous opioid system, leading to greater pain and cross-tolerance to prescription opioids. It can be a red flag: a person who is consuming a lot of cigarettes (i.e., nicotine), and put into practice programs to prevent opioid misuse.
+
+```{r, collapse=TRUE, warning=FALSE, message=FALSE}
+# combining datasets
+data <- data %>% 
+  left_join(fagerstrom, by = "who")
+```
+
+Also, an interesting factor that can be associated to OUD is the quality of life (i.e., whether people are homeless or living in a shelter). This data is provided by the PhenX Quality of Life Survey.
+
+```{r, collapse=TRUE, warning=FALSE, message=FALSE}
+# combining datasets
+data <- data %>% 
+  left_join(qol, by = "who")
+```
+
+The adherence to the programmed sessions could be a key predictor for health outcomes like withdrawal symptoms. We are going to extract the days that participants attended the programmed sessions, and calculate the percentage of satisfied sessions. These numbers have to be taken carefully because a session categorized as `Missing` could be a session where participant was late.
+
+```{r, collapse=TRUE, warning=FALSE, message=FALSE}
+# calculate the adherence of participants to programmed sessions as percentage dividing the attended visits by the total number of programmed visits
+new.visit <- derived_visitImputed %>%
+  group_by(who, visitImputed) %>%
+  summarise(n = n()) %>%
+  pivot_wider(names_from = visitImputed, values_from = n) %>%
+  ungroup() %>%
+  mutate(total = Missing + Present,
+         perc = Present / total) %>%
+  select(who, perc)
+
+# combining datasets
+data <- data %>% 
+  full_join(new.visit, by = "who")
+```
+
+Next, we are going to add the treatment that each participant received, and the day they started the assigned treatment.
+
+```{r, collapse=TRUE, warning=FALSE, message=FALSE}
+# removing duplicated IDs (we ensured that duplicated participants received all the same treatement); assumption: if inductDelay is NA, then we used the randomization day as the day which treatments started
+new.random <- randomization %>% 
+  filter(!duplicated(who)) %>%
+  mutate(inductDelay = derived_inductDelay$inductDelay,
+         final.when = ifelse(inductDelay %in% NA, when, when + inductDelay)) %>%
+  select(who, treatment, final.when)
+
+# combining datasets
+data <- data %>%
+  full_join(new.random, by = "who")
+```
+
+Also, it is important to see how treatments are effective against pain, which is the principal cause for which opioids are prescribed. Therefore, we select the pain scores that were registered after treatment engagement to identify, if possible, what treatment was associated to lower levels of pain.
+
+```{r, collapse=TRUE, warning=FALSE, message=FALSE}
+# combining datasets
+data <- data %>% 
+  full_join(pain, by = "who") %>% 
+  
+  # variable creation indicating whether the day registered in the pain dataset is higher than the day of treatment involvement (when.y is the day that pain was registered)
+  mutate(validation = ifelse(when.y > final.when, 1, 0))
+
+# when we analyze pain, we should filter the dataset by only the values == 1
+```
+
+Finally, we also add the withdrawal symptoms, which can be a condition in this population really debilitating. It would be really useful and informative to investigate which treatment caused the greatest withdrawal symptoms reduction and for which people.
+
+```{r, collapse=TRUE, warning=FALSE, message=FALSE}
+# creating the new withdrawal dataset
+new_withdrawal <- withdrawal_pre_post %>% 
+  
+  # transforming the dataset to wide format
+  pivot_wider(names_from = what, values_from = c(withdrawal, when)) %>% 
+  
+  # days between pain assessments
+  mutate(duration_pre_post = when_post - when_pre) %>%
+
+# ordering columns
+  select(who, withdrawal_pre, withdrawal_post, when_pre, when_post, duration_pre_post)
+
+# It would be interesting to consider whether the symptoms were assessed before or after the patient started to received its assigned treatment
+
+
+# combining datasets
+data <- data %>%
+  full_join(new_withdrawal, by = "who")
+```
+
+Our final dataset looks like this:
+
+```{r, collapse=TRUE, warning=FALSE, message=FALSE}
+data %>%
+  mutate(perc = round(perc, 3)) %>%
+  head() %>%
+  kbl() %>%
+  kable_styling(position = "left")
+```
+
+## Pain
+
+Opioids are often prescribed by doctors as **painkillers**, as they can relieve pain by blocking the pain signals between the body and the brain. The most effective treatment to relieve pain in these patients remain unknown due to the poor study methodology, and lack of evidence relating to possible harms [@Avery2022]. Thus, it would be useful for healthcare professionals evidence on which treatment is associated with lower pain levels, and in which specific subpopulations.
+
+::: callout-note
+To conduct this analysis, we first filtered by pain registers collected **after** treatment involvement trying to establish an association between treatment, and post-treatment levels. It would be very helpful in future studies to collect pre-treatment data to analyze between and inter-personal variability on pain levels in this population.
+:::
+
+### Fitting the models
+
+In this section, we performed a predictive model using a multinomial log-linear model to predict the responses on **pain levels** of patients after being treated adjusting by the symptomatology before receiving the treatment and other demographics characteristics such as age and race. Then, we compared several models' fit to ensure we predict the responses using the most exact model.
+
+```{r, warning=FALSE, message=FALSE}
+# ensuring replicability
+set.seed(19042023)
+
+# fitting multinomial models
+## model adjusting by treatment 
+model <- multinom(pain ~ treatment, data = data, trace = FALSE)
+
+## model adjusting by treatment and other covariates
+model.1 <- multinom(pain ~ treatment + race + age + withdrawal_pre, data = data, trace = FALSE)
+```
+
+### Model fit comparison
+
+Next, we are going to compare the fit of the performed models. We used two model fit parameters: the **Akaike Information Criterion** (**AIC**) and the **deviance**. Lower values in both parameters mean a better model fit. Differences in more than 5 points in the AIC is sufficient to rule out the model with the higher AIC value.
+
+```{r}
+## model fit comparison
+data.frame(Models = c("Model (treatment)",
+                      "Model (treatment + more predictors)"),
+           AIC = c(model$AIC, model.1$AIC),
+           Deviance = c(model$deviance, model.1$deviance)) %>%
+  kbl()
+```
+
+The model with all predictors (i.e., the assigned treatment, the severity of withdrawal symptoms before the treatment, age, and the race) outperformed the simplest model. Therefore, we will use it to predict the probability of pain relief considering the treatment received, the severity of withdrawal symptoms before treatment, and the self-reported race adjusted by age.
+
+### Plotting the predictions
+
+```{r, fig-1, fig.height=8, fig.width=8, warning=FALSE}
+#| label: fig-1
+#| fig-subcap: "Notes. BUP: Buprenorphine; NR-NTX: Extended-release Naltrexone; SMM: Standard Medical Management; EMM: Enhanced Medical Management (SMM + Indivdual Drug Counselling)." 
+#| warning: false
+#| fig-cap: "Predictions for pain levels adjusted by race, age, and withdrawal symptoms before treatment involvement."
+
+# plot
+marginaleffects::predictions(model.1) %>% 
+  as.data.frame() %>%
+  filter(group != "Missing") %>%
+  mutate(group = factor(group, levels = c("No Pain",
+                                          "Very mild to Moderate Pain",
+                                          "Severe Pain"))) %>%
+  group_by(treatment, withdrawal_pre, race, group) %>%
+  mean_qi(estimate) %>%
+  as.data.frame() %>%
+  mutate(treatment = reorder(treatment, estimate)) %>%
+  ggplot(aes(x = withdrawal_pre, y = .lower)) +
+  geom_pointinterval(aes(ymin = .lower, 
+                         ymax = .upper, 
+                         col = treatment),
+                     position = position_dodge(width = 0.5)) +
+  facet_grid(race ~ group, 
+             scales = "free") +
+  labs(col = "Treatment",
+       x = "Withdrawal symptoms before treatment",
+       y = "Probability of experimenting a specific pain level") +
+  theme_dark() +
+  scale_color_viridis_d(option = "H") +
+  scale_y_continuous(limits = 0:1, 
+                     breaks = seq(0, 1, 0.25)) +
+  scale_x_discrete(labels = c("None",
+                              "Mild ",
+                              "Moderate",
+                              "Severe")) +
+  theme(legend.position = "bottom",
+        legend.box = "vertical",
+        strip.text = element_text(size = 9))
+```
+
+We can observe that **naltrexone** and **buprenorphine** administered to **institutionalized** **patients** showed the highest probability of total pain relief in all subpopulations regardless withdrawal symptoms before starting the treatment (@fig-1). Interestingly, more severe withdrawal symptoms before treatment involvement were associated with lower probabilities of pain relief; therefore, detox treatments for these patients are key for reducing opioid withdrawal symptoms, and potentially, achieve a complete pain relief. Although lack of rigorous evidence, a rapid review showed evidence supporting the practice of continuing methadone or buprenorphine for patients taking medication for OUD during acute pain episodes [@Veazie2020]. Furthermore, a clinical guideline for treating pain in patients with OUD by the Commonwealth of Pennsylvania also supports the use of buprenorphine for managing acute pain in OUD patients, indicating that there are data suggesting better performing of buprenorphine when compared to methadone, for example [@Compton2001]. Evidence on naltrexone suggests that the extended-release (i.e., injectable) option is the preferred one for patients who would like to avoid taking any form of opioid or for whom buprenorphine or methadone are contraindicated [@connery2015]. @tbl-1 displays all numerical data.
+
+```{r}
+#| label: tbl-1
+#| warning: false
+#| tbl-cap: "Table 1. Predicted probabilities of pain level after treatment."
+#| tbl-subcap: "Notes. 95% CI corresponds to the 95% confidence interval of the predicted probability."
+
+# table
+marginaleffects::predictions(model.1) %>% 
+  as.data.frame() %>%
+  filter(group != "Missing") %>%
+  mutate(group = factor(group, levels = c("No Pain",
+                                          "Very mild to Moderate Pain",
+                                          "Severe Pain"))) %>%
+  mutate(withdrawal_pre = case_when(
+    withdrawal_pre == "0" ~ "None",
+    withdrawal_pre == "1" ~ "Mild",
+    withdrawal_pre == "2" ~ "Moderate",
+    withdrawal_pre == "3" ~ "Severe"
+  ),
+  withdrawal_pre = factor(withdrawal_pre, levels = c("None",
+                                                     "Mild",
+                                                     "Moderate",
+                                                     "Severe"))) %>%
+  group_by(treatment, withdrawal_pre, race, group) %>%
+  mean_qi(estimate) %>%
+  as.data.frame() %>%
+  mutate(treatment = reorder(treatment, estimate)) %>%
+  select(treatment, withdrawal_pre,
+         race, group, estimate,
+         .lower, .upper) %>%
+  rename(Treatment = treatment,
+         `Symptoms before treatment` = withdrawal_pre,
+         Race = race,
+         `Pain level\nafter treatment` = group,
+         Probability = estimate,
+         `95% lower bound` = .lower,
+         `95% upper bound` = .upper) %>%
+  mutate_if(is.numeric, round, 3) %>%
+  kbl()
+```
+
+::: callout-important
+**Extended-release (injected) naltrexone** and **buprenorphine** administered in **institutionalized settings** were associated to higher probabilities of **pain relief**. Lower probabilities of pain relief, and smaller differences between treatments were detected in patients with more severe withdrawal symptoms.
+:::
+
+## Withdrawal symptoms
+
+When a patient with an addiction tries to stop taking the opioid, he or she may feel the symptoms of withdrawal, which include anxiety, wanting to take the drug again, hyperactivity, being easily agitated, increase in the blood pressure and heart rate, or rapid breathing. Though temporary, opioid withdrawal can be incredibly debilitating.
+
+In this section, we performed a predictive model using a multinomial log-linear model to predict the responses on withdrawal symptoms of patients after being treated adjusting by the symptomatology before receiving the treatment and other demographics characteristics such as gender and race. In addition, we compared several models' fit to ensure we predict the responses using the most exact model.
+
+### Fitting the models
+
+```{r, message=FALSE, warning=FALSE}
+# ensuring replicability
+set.seed(19042023)
+
+# Fitting the model with treatment and pre-score predictors
+mod <- multinom(factor(withdrawal_post) ~ treatment + withdrawal_pre, 
+                data = data,
+                trace = FALSE)
+
+# Fitting the model with treatment, pre-score, and gender predictors
+mod.1 <- multinom(factor(withdrawal_post) ~ treatment + withdrawal_pre + is_male, data = data,
+                trace = FALSE)
+
+# Fitting the model with treatment, pre-score, gender, and race predictors
+mod.2 <- multinom(factor(withdrawal_post) ~ treatment + withdrawal_pre + is_male + race, 
+                  data = data,
+                trace = FALSE)
+```
+
+### Model fit comparison
+
+Next, we are going to compare the fit of the performed models. We used two model fit parameters: the **Akaike Information Criterion** (**AIC**) and the **deviance**. Lower values in both parameters mean a better model fit. Differences in more than 5 points in the AIC is sufficient to rule out the model with the higher AIC value.
+
+```{r, warning=FALSE, message=FALSE}
+## Model fit comparison
+data.frame(Model = c("Model (treat + pre)",
+                     "Model (treat + pre + is_male",
+                     "Model (treat + pre + is_male + race)"),
+           AIC = c(mod$AIC, mod.1$AIC, mod.2$AIC),
+           Deviance = c(mod$deviance, mod.1$deviance, mod.2$deviance)) %>%
+  kbl()
+```
+
+The model with all predictors (i.e., the assigned treatment, the severity of withdrawal symptoms before the treatment, the gender, and the race) outperformed the rest of models. Therefore, we will use it to predict the probability of withdrawal symptoms considering the treatment received and the severity of withdrawal symptoms before treatment adjusted by gender and race.
+
+### Plotting the predictions
+
+```{r, fig-2, fig.height=7, fig.width=7}
+#| label: fig-2
+#| warning: false
+#| fig-cap: "Predictions for withdrawal symptoms severity adjusted by gender, self-reported race, and withdrawal symptoms before treatment."
+#| fig-subcap: "Notes. BUP: Buprenorphine; NR-NTX: Extended-release Naltrexone; SMM: Standard Medical Management; EMM: Enhanced Medical Management (SMM + Indivdual Drug Counselling)."
+
+plot_predictions(mod.2, condition = c("withdrawal_pre", "treatment"), type = "probs") +
+  facet_wrap(~ group,
+             labeller = as_labeller(c("0" = "Final status: No symptoms",
+                                      "1" = "Final status: Mild symptoms",
+                                      "2" = "Final status: Moderate symptoms",
+                                      "3" = "Final status: Severe symptoms"))) +
+  labs(x = "Withdrawal symptoms before the treatment",
+       y = "Probability of achieving the final status after treatment",
+       col = "Treatment") +
+  theme_dark() +
+  scale_color_viridis_d(option = "H") +
+  scale_x_discrete(labels = c("None",
+                              "Mild",
+                              "Moderate",
+                              "Severe")) +
+  theme(legend.position = "bottom",
+        legend.box = "vertical")
+```
+
+In @fig-2 we can observe the treatment predicted responses to withdrawal symptoms. The treatments showing the highest probability of no withdrawal symptoms after treatment regardless the associated symptoms before treatment involvement were those based on **Outpatient Buprenorphine + Enhanced Medical Management** (defined as Standard Medical Management plus Individual Drug Counselling) and **Outpatient Buprenorphine + Standard Medical Management**. For example, a person who suffered severe opiod withdrawal symptoms before treatment and received **Outpatient Buprenorphine + EMM** had a probability of **0.693** (95% CI 0.658 to 0.716) of total withdrawal symptoms recovery. Comparably, if the same person would receive **Methadone** or **isolated Outpatient Buprenorphine** (i.e., no EMM or SMM), he/she would have probabilities of no withdrawal symptoms of 0.279 (95% CI 0.218 to 0.412), and 0.231 (95% CI 0.171 to 0.329), respectively. Evidence showing different characteristics associated to outpatient and inpatient settings suggests that outpatients can be favored for controlling withdrawal symptoms [@Varney2021]. In addition, **inpatient treatments** resulted in less effective interventions, achieving a potential reduction of severe symptoms, but with a very low probability of total withdrawal symptoms recovery. **Naltrexone** presented more benefits than **buprenorphine** in **inpatients** for withdrawal symptoms. Evidence supports this finding showing that naltrexone is an *opioid antagonist*, meaning that it works differently than methadone and buprenorphine to treat OUD by blocking opioid receptor activity [@Varney2021]. Numerical values are presented in @tbl-2.
+
+```{r, warning=FALSE, tbl-2}
+#| label: tbl-2
+#| warning: false
+#| tbl-cap: "Table 2. Predicted probabilities of withdrawal symptoms after treatment."
+#| tbl-subcap: "Notes. 95% CI corresponds to the 95% confidence interval of the predicted probability."
+
+predictions(mod.2) %>%
+  group_by(treatment, withdrawal_pre, group) %>%
+  mean_qi(estimate) %>% 
+  as.data.frame() %>% 
+  mutate(withdrawal_pre = case_when(
+    withdrawal_pre == "0" ~ "No symptoms",
+    withdrawal_pre == "1" ~ "Mild symptoms",
+    withdrawal_pre == "2" ~ "Moderate symptoms",
+    withdrawal_pre == "3" ~ "Severe symptoms"
+  ),
+  group = case_when(
+    group == "0" ~ "No symptoms",
+    group == "1" ~ "Mild symptoms",
+    group == "2" ~ "Moderate symptoms",
+    group == "3" ~ "Severe symptoms"
+  )) %>%
+  rename(Treatment = treatment,
+         `Symptoms before\ntreatment` = withdrawal_pre,
+         `Symptoms after\ntreatment` = group,
+         Probability = estimate,
+         `95% lower bound` = .lower,
+         `95% upper bound` = .upper) %>%
+  select(Treatment, `Symptoms before\ntreatment`,
+         `Symptoms after\ntreatment`, Probability, 
+         `95% lower bound`, `95% upper bound`) %>%
+  mutate_if(is.numeric, round, 3) %>%
+  kbl()
+```
+
+### Variability on withdrawal symptoms across time
+
+Fortunately, longitudinal registers of withdrawal symptoms are also collected. These data can help us to understand how opioid withdrawal symptoms fluctuate across time depending on the treatment and **dose** administered.
+
+#### Fitting the model
+
+To model these data, we used a generalized additive model (GAM), which can capture non-linear patterns, and are particularly valuable when investigating intricate dependencies (e.g., across time). First and foremost, we generated the dataset.
+
+```{r, warning=FALSE, message=FALSE}
+# Generating the dataset containing longitudinal registers for withdrawal symptoms
+gam_data <- treatment %>%
+  left_join(withdrawal, by = c("who", "when")) %>%
+  left_join(data %>%
+              select(who, treatment, is_male, race))
+
+# Setting a seed for replicability
+set.seed(123)
+
+# fitting a generalized additive model (GAM) adjusting by treatment-dose interaction
+model <- bam(withdrawal ~ treatment:amount + s(when, by = treatment) + s(who, bs = "re"),
+             data = gam_data %>% mutate(withdrawal = as.numeric(withdrawal)),
+             family = gaussian())
+
+# computing predictions
+pred_gam <- predictions(model)
+```
+
+Clinicians can gain advantage of these results optimizing the dose needed to alleviate those symptoms, pruning the probability of potential overdose cases. In @fig-3, it can be observed that **methadone** administered in higher doses (e.g., 50 mg/day) did not show improvements in the first 10 days. Comparably, higher doses of **buprenorphine** in **inpatients** did not show benefits on withdrawal symptoms compared to lower doses, which reduced the severity of these symptoms. Injected **naltrexone** on **inpatients** presented a reduction in withdrawal symptoms up to three months after treatment beginning. Higher doses of **buprenorphine** in **outpatients** can be related to patients with more severe additions, and thus, more severe withdrawal symptoms; so, it can be beneficial for those patients to receive medically-controlled prescribed higher doses. Conversely, when **buprenorphine** is administered to **outpatients** combined with **EMM** or **SMM**, higher doses were associated with benefits on those symptoms.
+
+```{r, warning = FALSE, message = FALSE, fig-3}
+#| label: fig-3
+#| fig-cap: "Withdrawal symptoms across time for different doses of the analyzed treatments."
+#| fig-subcap: "Notes. BUP: Buprenorphine; NR-NTX: Extended-release Naltrexone; SMM: Standard Medical Management; EMM: Enhanced Medical Management (SMM + Indivdual Drug Counselling)."
+
+# plot
+pred_gam %>%
+  group_by(treatment, amount, when) %>%
+  mean_qi(estimate) %>% 
+  mutate(estimate_class = case_when(
+    estimate < 0.5 ~ "None",
+    estimate >= 0.5 & estimate < 1.5 ~ "Mild",
+    estimate >= 1.5 & estimate < 2.5 ~ "Moderate",
+    estimate >= 2.5 ~ "Severe"
+  )) %>%
+  ggplot(aes(x = when, y = amount, z = estimate)) +
+  geom_tile(aes(fill = estimate_class)) +
+  facet_wrap(~ treatment, scales = "free_x") +
+  labs(x = "Time (days)",
+       y = "Doses (mg of administered drug)",
+       fill = "Withdrawal symptoms") +
+  theme_dark() +
+  scale_fill_manual(values = c("Mild" = "yellow",
+                               "Moderate" = "orange",
+                               "Severe" = "red")) +
+  theme(legend.position = "bottom",
+        legend.box = "vertical") +
+  scale_y_continuous(breaks = c(1, seq(10, 60, 10)),
+                     labels = c("Injected", seq(10, 60, 10)))
+```
+
+::: callout-important
+**Buprenorphine + EMM** or **SMM** was the most beneficial for alleviating withdrawal symptoms in **outpatients**. For **inpatients**, **injectable naltrexone** seems to be a better option to face withdrawal symptoms than methadone. **More doses have not to be necessarily associated with better outcomes**, which should be carefully prescribed.
+:::
+
+## Adherence rate
+
+After predicting the most beneficial treatments for alleviating withdrawal symptoms, it is needed to analyze which of them have associated the lowest attrition rate (i.e., the highest adherence to the treatment), since it is a key factor to achieve the predicted effectiveness. Currently, adherence to and retention in medications for OUD (i.e., the continuous engagement in treatment) is incompletely understood by healthcare professionals [@Viera2020]. Several factors at the individual, interpersonal, and institutional levels have been associated to OUD treatments; among them, OUD treatment dosage, which will be analyzed in the next section.
+
+### Fitting the model
+
+Based on previous exploratory data analyses, we conducted a linear model to predict adherence rates using the assigned treatment, the race of the participant, and the withdrawal symptoms before receiving the assigned treatment.
+
+```{r, warning=FALSE}
+# Setting a seed for replicability
+set.seed(123)
+
+# Fitting the model
+model_ad <- lm(perc ~ treatment + race + withdrawal_pre, data = data %>% filter(!is.na(withdrawal_pre)))
+
+# Summary of the model
+summary(model_ad)
+```
+
+### Predictions
+
+To ease the interpretation of the model, these numbers displayed help us to predict the adherence rate of a participant with specific characteristics. For example, we can predict the adherence rate of a **non-hispanic** **black participant** who were assigned to the "**Inpatient BUP**" treatment with **severe withdrawal symptoms**.
+
+```{r, collapse=TRUE, warning=FALSE, message=FALSE}
+# Prediction model
+prediction <- predict(model_ad, newdata = tibble(race = "Non-Hispanic Black",
+                                       treatment = "Inpatient BUP",
+                                       withdrawal_pre = "3")) %>% as.numeric()
+
+# Result
+paste("The predicted adherence rate for a non-Hispanic black participant with severe withdrawal symptoms assigned to the Inpatient BUP treatment is ", round(prediction, 2) * 100, "%", sep = "")
+```
+
+We can see that if the same person would be assigned to another treatment (e.g., "Methadone"), the adherence rate would be different.
+
+```{r, collapse=TRUE, warning=FALSE, message=FALSE}
+# Prediction model
+prediction <- predict(model_ad, newdata = tibble(race = "Non-Hispanic Black",
+                                       treatment = "Methadone",
+                                       withdrawal_pre = "3")) %>% as.numeric()
+
+# Result
+paste("The predicted adherence rate for a non-Hispanic black participant with severe withdrawal symptoms assigned to the Inpatient BUP treatment is ", round(prediction, 2) * 100, "%", sep = "")
+```
+
+In @fig-4, we can observe the variability in the adherence rate considering which treatment they received, and the withdrawal symptoms they experienced before treatment. **Methadone** showed really good adherence rates followed by the buprenorphine administered in participants who were institutionalized. It is an interesting finding, since we previously found that buprenorphine + EMM or SMM were the most effective interventions to reduce withdrawal symptoms; however, the adherence to the treatment is one of the most important factors to consider when a clinician prescribes a specific treatment in OUD patients. Therefore, it seems that methadone is one of the best treatments that showed a valuable trade-off between effectiveness and patient adherence. Additionally, **patients that suffered from withdrawal symptoms** regardless the severity of them **had associated more adherence rates than patients with no symptoms**. That could be explained by the need of people suffering withdrawal symptoms to alleviate these symptoms with treatment drugs.
+
+```{r, warning=FALSE, message=FALSE}
+# data frame for prediction
+newdata <- expand.grid(race = unique(data$race),
+                       treatment = unique(data$treatment),
+                       withdrawal_pre = unique(data$withdrawal_pre)) %>% 
+  drop_na()
+
+# predictions 
+pred <- predict(model_ad, newdata)
+```
+
+```{r, fig-4, fig.height=7, fig.width=7}
+#| label: fig-4
+#| warning: false
+#| fig-cap: "Predictions for adherence rates in the analyzed treatments adjusting by different severity degress of withdrawal symptoms before treatment."
+#| fig-subcap: "Notes. BUP: Buprenorphine; NR-NTX: Extended-release Naltrexone; SMM: Standard Medical Management; EMM: Enhanced Medical Management (SMM + Indivdual Drug Counselling)." 
+
+# plotting predictions
+newdata %>% cbind(pred) %>%
+  mutate(treatment = reorder(treatment, pred)) %>%
+  ggplot(aes(y = pred, x = withdrawal_pre)) +
+  stat_pointinterval(aes(col = treatment),
+                     position = position_dodge(width = 0.3)) +
+  theme_dark() +
+  scale_color_viridis_d(option = "H") +
+  scale_x_discrete(labels = c("None",
+                              "Mild",
+                              "Moderate",
+                              "Severe")) +
+  theme(legend.position = "bottom",
+        legend.box = "vertical") +
+  labs(x = "Withdrawal symptoms before treatment",
+       y = "Probability of predicted adherence rate (attended sessions)",
+       col = "Treatment") +
+  scale_y_continuous(breaks = seq(0.2, 1, 0.05))
+```
+
+### Does dose-treatment combination influence in the treatment adherence?
+
+As we stated in the previous section, medication dosage can play a role in the treatment adherence. Therefore, we used the longitudinal dataset previously created to predict the adherence to the assigned treatment depending on the median dose that patients received.
+
+#### Fitting the linear model
+
+```{r, message=FALSE, warning=FALSE}
+# linear model
+ad.model.gam <- gam_data %>% group_by(who) %>% median_qi(amount) %>%
+  select(who, amount) %>%
+  full_join(data, by = "who") %>%
+  lm(perc ~ treatment:amount + withdrawal_pre + per_day, data = .) # model with best fit
+```
+
+#### Predictions and plot
+
+Percentage of adherence to the assigned treatment is shown in @fig-5. **Medication dosage** has a **great influence** on the treatment **adherence** regardless withdrawal symptoms before treatment, with **higher doses** associated with **higher adherence**. Administering the same dose in oral-consumed treatments, **buprenorphine** showed more adherence rates compared to methadone in **outpatients**. However, **60 mg/day** of **methadone** was associated with the greatest treatment adherence rate. **Injectable nalextrone** achieved a considerable adherence rate in **inpatients**. As we have already detected, **patients with no withdrawal symptoms had associated lower treatment adherence rates**.
+
+```{r, warning=FALSE, message=FALSE, fig-5, fig.width=7, fig.height=6}
+#| label: fig-5
+#| fig-cap: "Predictions for adherence rates adjusted by drug dosage and withdrawal symptoms before treatment for the analyzed treatments."
+#| fig-subcap: "Notes. BUP: Buprenorphine; NR-NTX: Extended-release Naltrexone; SMM: Standard Medical Management; EMM: Enhanced Medical Management (SMM + Indivdual Drug Counselling). Injected drugs were only used in inpatients (i.e., buprenorphine and naltrexone)."
+#| message: false
+
+# plotting the predictions
+marginaleffects::predictions(ad.model.gam, 
+                             newdata = datagrid(treatment = unique(data$treatment),
+                                                              amount = c(1, 10, 20, 30, 40, 50, 60),
+                                                              withdrawal_pre = unique(data$withdrawal_pre),
+                                                              per_day = unique(data$per_day)[c(1, 2, 4)])) %>% 
+  as.data.frame() %>% 
+  drop_na() %>% 
+  
+  # validating only approved doses of medications
+  mutate(check = case_when(
+    treatment == "Inpatient NR-NTX" & amount > 1 ~ 1,
+    treatment %in% c("Inpatient BUP",
+                     "Outpatient BUP",
+                     "Outpatient BUP + EMM",
+                     "Outpatient BUP + SMM") & amount > 30 ~ 1,
+    TRUE ~ 0)) %>%
+  filter(check == 0) %>%
+  group_by(treatment, amount, withdrawal_pre) %>%
+  mean_qi(estimate) %>%
+  arrange(estimate) %>%
+  ggplot(aes(x = amount, y = estimate)) +
+  geom_pointinterval(aes(col = withdrawal_pre,
+                         ymin = .lower, ymax = .upper),
+                     position = position_dodge(width = 5.5)) +
+  facet_wrap(~ treatment) +
+  labs(x = "Dose (mg of administered drug)",
+       y = "Percentage of adherence to the assigned treatment",
+       col = "Withdrawal symptoms") +
+  theme_dark() +
+  scale_color_viridis_d(option = "H",
+                        labels = c("None",
+                                   "Mild",
+                                   "Moderate",
+                                   "Severe")) +
+  scale_y_continuous(breaks = seq(0.1, 1, 0.1),
+                     labels = scales::label_percent(),
+                     limits = c(0.3, 0.95)) +
+  scale_x_continuous(breaks = c(1, 10, 20, 30, 40, 50, 60),
+                     labels = c("1 or\nInjected", 10, 20, 30, 40, 50, 60)) +
+  theme(legend.position = "bottom",
+        legend.box = "vertical")
+```
+
+::: callout-important
+**Methadone** was associated with the highest treatment adherence rates. **Higher doses were associated with higher rates of treatment adherence**. Administering a similar dose, **buprenorphine** also showed good adherence rates for outpatients and inpatients.
+:::
+
+## Combining evidence on adherence, effectiveness on withdrawal symptoms and pain: guiding treatment selection
+
+While a large proportion of people with OUD return to consume at some point in their lives, the risk of death is mitigated by remaining in treatment. Moreover, the predicted effectiveness of the different analyzed treatments can vary if patients would not attend approximately half of the programmed visits (predictions were computed averaging the percentage of adherence rates = `r paste(round(mean(data$perc, na.rm = TRUE)*100, 2), "%", sep = "")`). Thus, healthcare professionals should consider the mean adherence rate of the treatment of interest and its effectiveness on withdrawal symptoms alleviation, and pain relief when prescribing specific treatments for OUD patients. Therefore, when two treatments achieve similar effectiveness on an outcome of interest (e.g., after the initial physical and historical patient examination, it is possible that the main outcome that should be treated would be opioid withdrawal symptoms), the treatment that has associated higher adherence rates should be selected, and vice versa (i.e., if two treatments achieve similar adherence, the treatment predicted as the most beneficial should be selected). For a global vision of the main concerns in OUD patients, we present the @fig-6.
+
+#### Data processing
+
+For adherence rates, we have just predicted outcomes following our linear model. For pain levels, we predicted the probabilities for the analyzed treatments to achieve a total pain relief (i.e., outcome = `No Pain`). For opioid withdrawal symptoms, we predicted for each level of severity (i.e., `0` = `None`; `1` = `Mild`; `2` = `Moderate`; `3` = `Severe`) only the probabilities to alleviate the symptoms that existed before treatment (e.g., if a patient suffered moderate withdrawal symptoms, the probabilities of achieve mild or any symptoms).
+
+```{r, warning=FALSE, message=FALSE}
+# adherence rate data
+adherence.data <- newdata %>% 
+  cbind(pred) %>%
+  group_by(treatment, withdrawal_pre) %>%
+  mean_qi(pred) %>%
+  select(treatment, withdrawal_pre, pred, .lower, .upper) %>%
+  rename(adherence = pred,
+         ad.lower = .lower,
+         ad.upper = .upper)
+
+# pain data
+pain.data <- marginaleffects::predictions(model.1) %>% 
+  as.data.frame() %>%
+  filter(group != "Missing") %>%
+  mutate(group = factor(group, levels = c("No Pain",
+                                          "Very mild to Moderate Pain",
+                                          "Severe Pain"))) %>%
+  group_by(treatment, withdrawal_pre, group) %>%
+  mean_qi(estimate) %>%
+  as.data.frame() %>%
+  mutate(treatment = reorder(treatment, estimate)) %>%
+  
+  # only conserve data related to 'no pain' outcomes
+  filter(group == "No Pain") %>%
+  select(treatment, withdrawal_pre, estimate, .lower, .upper)
+
+
+
+# withdrawal effectiveness data
+withd.data <- predictions(mod.2) %>%
+  group_by(treatment, withdrawal_pre, group) %>%
+  mean_qi(estimate) %>%
+  as.data.frame() %>%
+  
+  # only conserve data correspond to withdrawal symptoms improvement
+  mutate(valid = case_when(
+    withdrawal_pre == 0 & group == 0 ~ 1,
+    withdrawal_pre == 1 & group == 0 ~ 1,
+    withdrawal_pre == 2 & group %in% c(0, 1) ~ 1,
+    withdrawal_pre == 3 & group %in% c(0, 1, 2) ~ 1,
+    TRUE ~ 0
+  )) %>%
+  filter(valid == 1) %>%
+  group_by(treatment, withdrawal_pre) %>%
+  mean_qi(estimate) %>%
+  select(treatment, withdrawal_pre, estimate, .lower, .upper) %>%
+  rename(effectiveness = estimate, 
+         ef.lower = .lower,
+         ef.upper = .upper)
+
+
+# combining predictions of the outcomes of interest
+final.data <- adherence.data %>% 
+  full_join(withd.data, by = c("treatment", "withdrawal_pre")) %>%
+  full_join(pain.data, by = c("treatment", "withdrawal_pre")) %>%
+  mutate(withdrawal_pre = factor(withdrawal_pre,
+                                 levels = c("0", "1", "2", "3"),
+                                 labels = c("None",
+                                            "Mild", 
+                                            "Moderate",
+                                            "Severe"))) %>%
+  rename(`Withdrawal symptoms before treatment` = withdrawal_pre)
+```
+
+#### Plot
+
+To ease the understanding of the @fig-6, you have to take into account:
+
+1.  You can stop the animation to observe the results for the treatment of interest for patients with specific withdrawal symptoms severity.
+
+2.  If you are not able to observe an axis title, you can rotate the figure.
+
+3.  Each treatment has associated a specific color.
+
+4.  You can freely move the slider to observe the results for a determined withdrawal symptoms' severity.
+
+5.  If you put your mouse over a point, the results for this point are displayed considering that **axis x** corresponds to the **adherence rate**, **y axis** refers to **withdrawal symptoms' improvement**, and **z axis** corresponds to **pain relief** outcomes.
+
+```{r, fig-6, warning=FALSE, message=FALSE, fig.height=7, fig.width=7}
+#| label: fig-6
+#| fig-cap: "Evidence on adherence, withdrawal symptoms alleviation, and pain relief for the analyzed treatments adjusted by different degrees of withdrawal symptoms before treatment severity."
+#| message: false
+
+# plot
+plot_ly(final.data,
+        x = ~adherence, y = ~effectiveness, z = ~estimate,
+        color = ~treatment,
+        frame = ~`Withdrawal symptoms before treatment`,
+        mode = "markers",
+        type = "scatter3d") %>%
+  layout(scene = list(xaxis = list(title = "Adherence"),
+                      yaxis = list(title = "Withdrawal symptoms improvement"),
+                      zaxis = list(title = "Pain relief"))) %>%
+  animation_opts(frame = 3000, easing = "elastic", redraw = TRUE) %>%
+  animation_slider(currentvalue = list(prefix = "Withdrawal symptoms before treatment: ",
+                                       font = list(color = "red")))
+```
+
+::: callout-important
+### Take-home messages
+
+Based on the evidence synthesized in these analyses, we can establish the following care paths after initial withdrawal symptom severity diagnosis through physical examination, and patient clinical history. Depending on the main outcome of interest to treat, we propose the three most beneficial treatments for each case. When two treatments' effectiveness were similar, the one with greater adherence rate appears first.
+
+-   For patients with **no withdrawal symptoms** before treatment:
+
+    -   Outcome of interest:
+
+        -   **Pain**: Inpatient BUP, Inpatient NR-NTX, or Outpatient BUP + SMM.
+
+        -   **Withdrawal symptoms**: Outpatient BUP + SMM, Methadone, or isolated Outpatient BUP.
+
+-   For patients with **mild withdrawal symptoms** before treatment:
+
+    -   Outcome of interest:
+
+        -   **Pain**: Inpatient BUP, Inpatient NR-NTX, or Outpatient BUP + EMM (low effectiveness).
+
+        -   **Withdrawal symptoms**: Outpatient BUP + EMM, Outpatient + SMM, or Methadone.
+
+-   For patients with **moderate withdrawal symptoms** before treatment:
+
+    -   Outcome of interest:
+
+        -   **Pain**: Inpatient BUP, Inpatient NR-NTX, or Outpatient BUP + EMM (low effectiveness).
+
+        -   **Withdrawal symptoms**: Methadone, Outpatient BUP + SMM, or Outpatient BUP + EMM.
+
+-   For patients with **severe withdrawal symptoms** before treatment:
+
+    -   Outcome of interest:
+
+        -   **Pain**: Inpatient BUP, Inpatient NR-NTX, or Outpatient BUP + EMM (very low effectiveness).
+
+        -   **Withdrawal symptoms**: Methadone, Outpatient BUP + SMM, or Outpatient BUP + EMM.
+:::
+
+```{r, warning=FALSE, message=FALSE}
+sessionInfo()
+```
