@@ -1,9 +1,27 @@
 ---
-title: "About"
+title: "About the authors"
+image: EPAFit_logo.png
+about: 
+  id: hero-heading
+  template: jolla
+  links: 
+    - icon: twitter-x
+      text: Twitter (Daniel)
+      href: https://twitter.com/DanielG12754470
+    - icon: twitter-x
+      text: Twitter (Borja)
+      href: https://twitter.com/BorjadelPozoCr1
+    - icon: github
+      text: GitHub
+      href: https://github.com/dgalgom
 ---
 
-About this site
+::: {#hero-heading}
+![Daniel Gallardo Gómez](daniel_foto.png){fig-align="center"}
 
-```{r}
-1 + 1
-```
+Daniel Gallardo Gómez is a data scientist and researcher in Health Technology Assessment and Population Health at Health Technology Assessment Area (AETSA) of the Andalusian Public Foundation Progress and Health (FPS). He belongs to the Epidemiology of Physical Activity and Fitness Across Lifespan (EPAFit) Research Group (\@EPAFitResGroup). His main research program is broadly based in Public Health, and Data Science, with a focus on the development and application of complex evidence-based synthesis methods to analyze clinically relevant health outcomes and treatments in both, healthy and pathological populations, providing useful insights for evidence-based decision-making processes. Daniel is also working on the development and validation of different AI-based predictive models to efficiently distribute available health system resources.
+
+![Borja del Pozo Cruz](borja_foto.png){fig-align="center"}
+
+Borja del Pozo Cruz is a leading scientist int he fields of Lifestyle, Preventive Medicine, and Public Health. He worked as an Associate Professor at Southern Denmark University, where he currently holds an honorary professorship position. He also belongs to the Epidemiology of Physical Activity and Fitness Across Lifespan (EPAFit) Research Group (\@EPAFitResGroup). Previous appointments include Senior Research Fellow at the Australian Catholic University, Senior Lecturer at Auckland University, and Assistant Lecturer at the University of Seville. Dr. del Pozo has been listed in the prestigious 2022 and 2023 editions of the Stanford University list of the top 2% of Scientists worldwide, recognizing world leaders in their respective fields. Dr. del Pozo's research program focuses on the dynamic interplay between sleep, sedentary behavior and physical activity, and how these, alongside other lifestyle behaviors, can be harnessed to improve population health.
+:::

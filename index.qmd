@@ -1,19 +1,20 @@
 ---
 title: "R/Medicine 2024 Data Challenge: Opioid Use Disorder"
 title-block-banner: "navy" 
+title-block-banner-color: "white"
 author:
 - name: Daniel Gallardo Gómez
   orcid: 0000-0002-3029-026X
   email: daniel.gallardo.gomez@juntadeandalucia.es
   affiliations:
-  - name: Health Technology Assessment Area (AETSA), Andalusian Public Foundation Progress and Health
+  - name: Health Technology Assessment Area (AETSA), Andalusian Public Foundation Progress and Health, Seville, Spain
   - name: Epidemiology of Physical Activity and Fitness Across Lifespan (EPAFit) Research Group
 - name: Borja del Pozo Cruz
   orcid: 0000-0003-3944-2212
   affiliations:
-  - name: Faculty of Education, University of Cadiz
-  - name: Biomedical Research and Innovation Institute of Cádiz (INiBICA) Research Unit, University of Cadiz
-  - name: Department of Sports Science and Clinical Biomechanics, University of Southern Denmark
+  - name: Faculty of Sports Sciences, European University of Madrid, Madrid, Spain
+  - name: Faculty of Biomedical and Health Sciences, European University of Madrid, Madrid, Spain
+  - name: Department of Sports Science and Clinical Biomechanics, University of Southern Denmark, Odensem Denmark
 lang: en
 format: 
   html: 
